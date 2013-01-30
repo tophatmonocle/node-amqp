@@ -116,7 +116,8 @@ var classes = {};
 
 var maxFrameBuffer = 131072; // 128k, same as rabbitmq (which was
                              // copying qpid)
-
+var emptyFrameSize = 8;      // This is from the javaclient
+var maxFrameSize = maxFrameBuffer - emptyFrameSize;
 // An interruptible AMQP parser.
 //
 // type is either 'server' or 'client'
@@ -929,7 +930,9 @@ function Connection (connectionArgs, options, readyCallback) {
   });
 
   self.addListener('data', function (data) {
-    parser.execute(data);
+    if(parser != null){
+      parser.execute(data);
+    }
     self._inboundHeartbeatTimerReset();
   });
 
@@ -1035,8 +1038,36 @@ Connection.prototype.reconnect = function () {
 };
 
 Connection.prototype.connect = function () {
+  // If you pass a array of hosts, lets choose a random host, or then next one.
+  var connectToHost = this.options.host;
+
+  if(Array.isArray(this.options.host) == true){
+    if(this.hosti == null){
+      this.hosti = Math.random()*this.options.host.length >> 0;
+    }else{
+      this.hosti = (this.hosti+1) % this.options.host.length;
+    }
+    connectToHost = this.options.host[this.hosti]
+  }
+
   // Connect socket
-  net.Socket.prototype.connect.call(this, this.options.port, this.options.host);
+  net.Socket.prototype.connect.call(this, this.options.port, connectToHost);
+  // Apparently, it is not possible to determine if an authentication error
+  // has occurred, but when the connection closes then we can HINT that a
+  // possible authentication error has occured.  Although this may be a bug
+  // in the spec, handling it as a possible error is considerably better than
+  // failing silently.
+  function possibleAuthErrorHandler() {
+    this.removeListener('end', possibleAuthErrorHandler);
+    this.emit('error', {
+      message: 'Connection ended: possibly due to an authentication failure.'
+    });
+  }
+  // add this handler with #on not #once (so it can be removed by #removeListener)
+  this.on('end', possibleAuthErrorHandler);
+  this.once('ready', function () {
+    this.removeListener('end', possibleAuthErrorHandler);
+  });
 };
 
 Connection.prototype._onMethod = function (channel, method, args) {
@@ -1088,6 +1119,10 @@ Connection.prototype._onMethod = function (channel, method, args) {
 
     // 4. The server responds with a connectionTune request
     case methods.connectionTune:
+      if (args.frameMax) {
+          debug("tweaking maxFrameBuffer to " + args.frameMax);
+          maxFrameBuffer = args.frameMax;
+      }
       // 5. We respond with connectionTuneOk
       this._sendMethod(0, methods.connectionTuneOk,
           { channelMax: 0
@@ -1277,67 +1312,51 @@ function sendHeader (connection, channel, size, properties) {
 
 
 Connection.prototype._sendBody = function (channel, body, properties) {
+  var r = this._bodyToBuffer(body);
+  var props = r[0], buffer = r[1];
+
+  properties = mixin(props, properties);
+
+  sendHeader(this, channel, buffer.length, properties);
+
+  var pos = 0, len = buffer.length;
+  while (len > 0) {
+    var sz = len < maxFrameBuffer ? len : maxFrameBuffer;
+
+    var b = new Buffer(7 + sz + 1);
+    b.used = 0;
+    b[b.used++] = 3; // constants.frameBody
+    serializeInt(b, 2, channel);
+    serializeInt(b, 4, sz);
+    buffer.copy(b, b.used, pos, pos+sz);
+    b.used += sz;
+    b[b.used++] = 206; // constants.frameEnd;
+    this.write(b);
+
+    len -= sz;
+    pos += sz;
+  }
+  return;
+}
+
+Connection.prototype._bodyToBuffer = function (body) {
   // Handles 3 cases
   // - body is utf8 string
   // - body is instance of Buffer
   // - body is an object and its JSON representation is sent
   // Does not handle the case for streaming bodies.
+  // Returns buffer.
   if (typeof(body) == 'string') {
-    var length = Buffer.byteLength(body);
-    //debug('send message length ' + length);
-
-    sendHeader(this, channel, length, properties);
-
-    //debug('header sent');
-
-    var b = new Buffer(7+length+1);
-    b.used = 0;
-    b[b.used++] = 3; // constants.frameBody
-    serializeInt(b, 2, channel);
-    serializeInt(b, 4, length);
-
-    b.write(body, b.used, 'utf8');
-    b.used += length;
-
-    b[b.used++] = 206; // constants.frameEnd;
-    return this.write(b);
-
-    //debug('body sent: ' + JSON.stringify(b));
-
+    return [null, new Buffer(body, 'utf8')];
   } else if (body instanceof Buffer) {
-    sendHeader(this, channel, body.length, properties);
-
-    var b = new Buffer(7);
-    b.used = 0;
-    b[b.used++] = 3; // constants.frameBody
-    serializeInt(b, 2, channel);
-    serializeInt(b, 4, body.length);
-    this.write(b);
-    this.write(body);
-
-    return this.write(new Buffer([206])); // frameEnd
+    return [null, body];
   } else {
     var jsonBody = JSON.stringify(body);
-    var length = Buffer.byteLength(jsonBody);
 
     debug('sending json: ' + jsonBody);
 
-    properties = mixin({contentType: 'application/json' }, properties);
-
-    sendHeader(this, channel, length, properties);
-
-    var b = new Buffer(7+length+1);
-    b.used = 0;
-
-    b[b.used++] = 3; // constants.frameBody
-    serializeInt(b, 2, channel);
-    serializeInt(b, 4, length);
-
-    b.write(jsonBody, b.used, 'utf8');
-    b.used += length;
-
-    b[b.used++] = 206; // constants.frameEnd;
-    return this.write(b);
+    var props = {contentType: 'application/json'};
+    return [props, new Buffer(jsonBody, 'utf8')];
   }
 };
 
@@ -1396,11 +1415,10 @@ Connection.prototype.exchange = function (name, options, openCallback) {
 };
 
 // Publishes a message to the default exchange.
-Connection.prototype.publish = function (routingKey, body, options) {
+Connection.prototype.publish = function (routingKey, body, options, callback) {
   if (!this._defaultExchange) this._defaultExchange = this.exchange();
-    return this._defaultExchange.publish(routingKey, body, options);
+  return this._defaultExchange.publish(routingKey, body, options, callback);
 };
-
 
 
 // Properties:
@@ -1642,11 +1660,16 @@ Queue.prototype.subscribe = function (/* options, messageListener */) {
       options.deliveryTagInPayload = arguments[0].deliveryTagInPayload;
     if (arguments[0].prefetchCount != undefined)
       options.prefetchCount = arguments[0].prefetchCount;
+    if (arguments[0].exclusive)
+        options.exclusive = arguments[0].exclusive;
 
   }
 
   // basic consume
-  var rawOptions = { noAck: !options.ack };
+  var rawOptions = {
+      noAck: !options.ack,
+      exclusive: options.exclusive
+  };
   if (options.ack) {
     rawOptions['prefetchCount'] = options.prefetchCount;
   }
@@ -1915,11 +1938,13 @@ Queue.prototype._onMethod = function (channel, method, args) {
       // If this is a reconnect, we must re-subscribe our queue listeners.
       var consumerTags = Object.keys(this.consumerTagListeners);
       for (var index in consumerTags) {
-        if (this.consumerTagOptions[consumerTags[index]]['state'] === 'closed') {
-          this.subscribeRaw(this.consumerTagOptions[consumerTags[index]], this.consumerTagListeners[consumerTags[index]]);
-          // Having called subscribeRaw, we are now a new consumer with a new consumerTag.
-          delete this.consumerTagListeners[consumerTags[index]];
-          delete this.consumerTagOptions[consumerTags[index]];
+        if (consumerTags.hasOwnProperty(index)) {
+          if (this.consumerTagOptions[consumerTags[index]]['state'] === 'closed') {
+            this.subscribeRaw(this.consumerTagOptions[consumerTags[index]], this.consumerTagListeners[consumerTags[index]]);
+            // Having called subscribeRaw, we are now a new consumer with a new consumerTag.
+            delete this.consumerTagListeners[consumerTags[index]];
+            delete this.consumerTagOptions[consumerTags[index]];
+          }
         }
       }
       break;
@@ -2005,6 +2030,8 @@ function Exchange (connection, channel, name, options, openCallback) {
   Channel.call(this, connection, channel);
   this.name = name;
   this.binds = 0; // keep track of queues bound
+  this.exchangeBinds = 0; // keep track of exchanges bound
+  this.sourceExchanges = {};
   this.options = options || { autoDelete: true};
   this._openCallback = openCallback;
 
@@ -2135,6 +2162,23 @@ Exchange.prototype._onMethod = function (channel, method, args) {
       this.emit('basic-return', args);
       break;
 
+    case methods.exchangeBindOk:
+        if (this._bindCallback) {
+            // setting this._bindCallback to null before calling the callback allows for a subsequent bind within the callback
+            var cb = this._bindCallback;
+            this._bindCallback = null;
+            cb(this);
+      }
+      break;
+
+    case methods.exchangeUnbindOk:
+      if (this._unbindCallback) {
+            var cb = this._unbindCallback;
+            this._unbindCallback = null;
+            cb(this);
+      }
+      break;
+
     default:
       throw new Error("Uncaught method '" + method.name + "' with args " +
           JSON.stringify(args));
@@ -2192,9 +2236,11 @@ Exchange.prototype.publish = function (routingKey, data, options, callback) {
     self._unAcked[self._sequence] = task
     self._sequence++
 
-    if(callback != null){ 
-      task.once('ack',   function(){task.removeAllListeners();callback(false)}); 
-      this.once('error', function(){task.removeAllListeners();callback(true)});
+    if(callback != null){
+      var errorCallback = function(){task.removeAllListeners();callback(true)};
+      var exchange = this;
+      task.once('ack',   function(){exchange.removeListener('error', errorCallback); task.removeAllListeners();callback(false)}); 
+      this.once('error', errorCallback);
     }
   }
 
@@ -2219,4 +2265,76 @@ Exchange.prototype.destroy = function (ifUnused) {
         , noWait: false
         });
   });
+};
+
+// E2E Unbind
+// support RabbitMQ's exchange-to-exchange binding extension
+// http://www.rabbitmq.com/e2e.html
+Exchange.prototype.unbind = function (/* exchange, routingKey [, bindCallback] */) {
+  var self = this;
+
+  // Both arguments are required. The binding to the destination 
+  // exchange/routingKey will be unbound. 
+
+  var exchange    = arguments[0]
+    , routingKey  = arguments[1]
+    , callback    = arguments[2]
+  ;
+
+  if(callback) this._unbindCallback = callback;
+
+  return this._taskPush(methods.exchangeUnbindOk, function () {
+    var source = exchange instanceof Exchange ? exchange.name : exchange;
+    var destination = self.name;
+
+    if(source in self.connection.exchanges) {
+      delete self.sourceExchanges[source];
+      self.connection.exchanges[source].exchangeBinds--;
+    }
+
+    self.connection._sendMethod(self.channel, methods.exchangeUnbind,
+        { reserved1: 0
+        , destination: destination
+        , source: source
+        , routingKey: routingKey
+        , noWait: false
+        , "arguments": {}
+        });
+  });
+};
+
+// E2E Bind
+// support RabbitMQ's exchange-to-exchange binding extension
+// http://www.rabbitmq.com/e2e.html
+Exchange.prototype.bind = function (/* exchange, routingKey [, bindCallback] */) {
+  var self = this;
+
+  // Two arguments are required. The binding to the destination 
+  // exchange/routingKey will be established. 
+
+  var exchange    = arguments[0]
+    , routingKey  = arguments[1]
+    , callback    = arguments[2]
+  ;
+    
+  if(callback) this._bindCallback = callback;
+
+
+  var source = exchange instanceof Exchange ? exchange.name : exchange;
+  var destination = self.name;
+
+  if(source in self.connection.exchanges) {
+    self.sourceExchanges[source] = self.connection.exchanges[source];
+    self.connection.exchanges[source].exchangeBinds++;
+  }
+
+  self.connection._sendMethod(self.channel, methods.exchangeBind,
+      { reserved1: 0
+      , destination: destination
+      , source: source
+      , routingKey: routingKey
+      , noWait: false
+      , "arguments": {}
+      });
+
 };
