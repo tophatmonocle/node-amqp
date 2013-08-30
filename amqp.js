@@ -1515,6 +1515,7 @@ Connection.prototype.queue = function (name /* options, openCallback */) {
   }
 
   this.channelCounter++;
+  if (DEBUG) { debug('channelcounter', channelCounter); }
   var channel = this.channelCounter;
 
   var q = new Queue(this, channel, name, options, callback);
