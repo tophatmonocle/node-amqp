@@ -1349,7 +1349,13 @@ Connection.prototype._sendMethod = function (channel, method, args) {
   serializeInt(b, 2, method.classIndex); // short, classId
   serializeInt(b, 2, method.methodIndex); // short, methodId
 
-  serializeFields(b, method.fields, args, true);
+  // Handle any serialization errors and inform queue of problems
+  try {                                                                                                                                                                   
+      serializeFields(b, method.fields, args, true);                                  
+  } catch (e) {                                                                 
+      this.channels[channel].emit('error', e);                                    
+      return;                                                                     
+  }   
 
   var endIndex = b.used;
 
